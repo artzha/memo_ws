@@ -1,5 +1,5 @@
 name: argo
-root: ~/foresight_ws
+root: ~/memo_ws
 pre_window: ./container shell
 
 windows:

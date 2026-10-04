@@ -22,7 +22,9 @@ ENV CUDA_MODULE_LOADING=LAZY \
     HUGGINGFACE_HUB_CACHE=/home/${username}/.cache/huggingface \
     TRANSFORMERS_CACHE=/home/${username}/.cache/huggingface
 
-WORKDIR /home/${username}/foresight_ws
+# The workspace basename config/mounts binds into /home/${username}; ./container passes it.
+ARG WS_NAME=memo_ws
+WORKDIR /home/${username}/${WS_NAME}
 
 ENTRYPOINT []
 CMD ["/bin/bash", "-l"]

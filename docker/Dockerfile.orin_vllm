@@ -35,7 +35,9 @@ RUN sed '/^transformers==/d' /opt/jetson-containers/pip-constraints.txt \
           "transformers==${TRANSFORMERS_PACKAGE_VERSION}" \
  && python -c "import vllm; from transformers import Gemma4Processor; assert vllm.__version__.startswith('0.19.0')"
 
-WORKDIR /home/${username}/foresight_ws
+# The workspace basename config/mounts binds into /home/${username}; ./container passes it.
+ARG WS_NAME=memo_ws
+WORKDIR /home/${username}/${WS_NAME}
 
 ENTRYPOINT []
 CMD ["/bin/bash", "-l"]

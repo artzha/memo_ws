@@ -1,0 +1,12 @@
+# colcon defaults for this workspace, picked up via COLCON_DEFAULTS_FILE
+# (/etc/profile.d/ros2.sh in docker/Dockerfile.thor_edgellm). Run colcon from
+# the workspace root.
+#
+# base-paths lists exactly the packages to build; discovery from src/ would
+# also pick up src/foresight_public and anything else checked out there.
+build:
+  base-paths: [src/amrl_msgs, src/memo/memo_deployment]
+list:
+  base-paths: [src/amrl_msgs, src/memo/memo_deployment]
+test:
+  base-paths: [src/amrl_msgs, src/memo/memo_deployment]

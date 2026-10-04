@@ -10,7 +10,7 @@ FROM ${BASE_STAGE_NAME} AS final
 ARG username=ros
 ARG EDGELLM_VERSION=v0.10.1
 ARG EDGELLM_ROOT=/opt/TensorRT-Edge-LLM
-ARG EDGELLM_VENV=/opt/edgellm-venv
+ARG XTOP_VERSION=v0.1.1
 # CUDA toolkit version of the base image; must match the JetPack 7.0/7.1 host.
 ARG CUDA_CTK_VERSION=13.0
 
@@ -24,9 +24,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         build-essential \
         git \
+        curl \
+        ca-certificates \
         python3-venv \
         libopenmpi-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# xtop: btop-like CPU/GPU/memory/IO monitor for watching benchmarks. Upstream
+# publishes amd64-only release binaries, so build from source with a throwaway
+# rustup toolchain that is removed once the binary is installed.
+# GPU metrics load NVML dynamically at runtime, so nothing links against it here.
+RUN export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo \
+ && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
+ && git clone --branch "${XTOP_VERSION}" --depth 1 https://github.com/joydeep-b/xtop.git /tmp/xtop \
+ && make -C /tmp/xtop install PREFIX=/usr/local CARGO=/tmp/cargo/bin/cargo \
+ && rm -rf /tmp/rustup /tmp/cargo /tmp/xtop \
+ && xtop --probe > /dev/null
 
 # C++ runtime: ONNX -> engine builders and the llm_inference benchmark binary.
 # The JetPack 7.0/7.1 Thor configuration from the Edge-LLM installation guide.
@@ -48,28 +61,166 @@ RUN git clone --branch "${EDGELLM_VERSION}" --depth 1 --recurse-submodules --sha
  && test -x examples/llm/llm_inference \
  && test -x examples/multimodal/visual_build
 
-# Python export environment. Export runs on the CPU, so the pinned torch and
-# torchvision resolve to CPU wheels instead of CUDA builds. The "tools" extra is
-# required rather than "export": the visual-encoder export path imports
-# nvidia-modelopt even for unquantized FP16 checkpoints.
-RUN python3 -m venv "${EDGELLM_VENV}" \
- && "${EDGELLM_VENV}/bin/pip" install --no-cache-dir --upgrade pip \
- && "${EDGELLM_VENV}/bin/pip" install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
+# Python stack, installed into the system interpreter: no venv. Edge-LLM's
+# export tooling and memo's model inference share one torch, so it is the CUDA
+# 13.0 build (sm_110) rather than the CPU wheels export alone would need. torch
+# and torchvision come first from the cu130 index, at the versions Edge-LLM pins,
+# so its own install finds them satisfied. The "tools" extra is required rather
+# than "export": the visual-encoder export path imports nvidia-modelopt even for
+# unquantized FP16 checkpoints. nvidia-modelopt needs setuptools>=80, above
+# colcon-core's declared cap; colcon build (incl. --symlink-install) still works,
+# so `pip check` flagging it is expected.
+#
+# Only the heavy, version-coupled packages are baked. memo itself and its light
+# deps are installed from the bind-mounted checkout when the container starts
+# (scripts/setup_memo.sh), constrained to what is frozen here.
+#
+# This runs before ROS on purpose: pip owns /usr/local/lib/python3.12, apt then
+# owns /usr/lib/python3, and pip never has to uninstall an apt package.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_ROOT_USER_ACTION=ignore
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        torch==2.13.0 torchvision==0.28.0 \
+ && pip install --no-cache-dir \
         -e "${EDGELLM_ROOT}[tools]" \
         pillow \
- && "${EDGELLM_VENV}/bin/tensorrt-edgellm-export" --help > /dev/null
+ && tensorrt-edgellm-export --help > /dev/null \
+ && python3 -c "import torch, transformers; assert torch.version.cuda.startswith('13.'), torch.version.cuda; from transformers import Qwen3_5ForConditionalGeneration" \
+ && mkdir -p /etc/memo && pip list --format=freeze --exclude-editable > /etc/memo/constraints.txt
+
+# Qwen3.5's fast path: flash-linear-attention (Triton kernels for the Gated
+# DeltaNet layers) and causal-conv1d (CUDA, compiled here for sm_110; there is no
+# aarch64 CUDA 13 wheel). Without them transformers falls back to a reference
+# implementation that launches ~5x more kernels; on Thor that cut MemoVLA's VLM
+# prefix from ~145 ms to ~55 ms. --no-build-isolation so causal-conv1d builds
+# against the torch above; constrained so neither can move the stack.
+RUN pip install --no-cache-dir -c /etc/memo/constraints.txt flash-linear-attention \
+ && CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=8 \
+    pip install --no-cache-dir --no-build-isolation -c /etc/memo/constraints.txt causal-conv1d \
+ && python3 -c "import fla, causal_conv1d" \
+ && pip list --format=freeze --exclude-editable > /etc/memo/constraints.txt
+
+# --- ROS 2 ------------------------------------------------------------------
+# Everything below sits after the Edge-LLM build so that editing it never
+# invalidates those (slow) layers.
+#
+# Humble has no Ubuntu 24.04 binaries, and the CUDA 13 base Thor needs is 24.04;
+# Jazzy is the noble LTS and runs on the base image's own Python 3.12.
+ARG ROS_DISTRO=jazzy
+# Must match the basename of the workspace that config/mounts binds into
+# /home/${username}; ./container passes it.
+ARG WS_NAME=memo_ws
+
+LABEL com.foresight.ros-distro="${ROS_DISTRO}"
+
+# ROS 2 requires a UTF-8 locale.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        locales \
+        lsb-release \
+        gnupg2 \
+    && locale-gen en_US.UTF-8 \
+    && update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8
+
+# ROS 2 from the official apt repo. Fetching ros.key from rosdistro master picks
+# up the current (rotated) signing key at build time. Headless: ros-base only.
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+        > /etc/apt/sources.list.d/ros2.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-ros-base \
+        ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+        ros-${ROS_DISTRO}-tf2-ros \
+        ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+        ros-${ROS_DISTRO}-foxglove-bridge \
+        ros-dev-tools \
+        python3-colcon-common-extensions \
+        python3-rosdep \
+ && rm -rf /var/lib/apt/lists/* \
+ && rosdep init && rosdep update --rosdistro "${ROS_DISTRO}"
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# --- User: the host's uid/gid, so files written into the bind mounts keep the host owner -----------------------
+# As docker/Dockerfile.orin: ./container passes the calling user's uid, gid and name. The base image already has a
+# uid-1000 user (`ubuntu`), which is renamed rather than duplicated. Here last among the slow layers, so a
+# different user only rebuilds from here.
+ARG uid=1000
+ARG gid=1000
+# "name:gid" pairs of the host's device groups (./container fills them in): the user joins groups with the
+# *host's* gids, which is what device-node permissions check (/dev/nvmap is root:video, renderD* root:render).
+ARG HOST_GROUPS="video:44"
+RUN set -e; \
+    # Primary group: gid ${gid}, named after the user.
+    if getent group ${gid} >/dev/null; then \
+        current=$(getent group ${gid} | cut -d: -f1); \
+        if [ "$current" != "${username}" ] && ! getent group ${username} >/dev/null; then groupmod -n ${username} "$current"; fi; \
+    else \
+        groupadd -g ${gid} ${username}; \
+    fi; \
+    # User: rename an existing uid-${uid} account (and move its home), else create one.
+    if getent passwd ${uid} >/dev/null; then \
+        current=$(getent passwd ${uid} | cut -d: -f1); \
+        if [ "$current" != "${username}" ]; then usermod -l ${username} -d /home/${username} -m "$current"; fi; \
+        usermod -g ${gid} -s /bin/bash ${username}; \
+    else \
+        useradd -u ${uid} -g ${gid} -m -s /bin/bash ${username}; \
+    fi; \
+    # Device groups at the host's gids: retarget a same-named group if that gid is free, else join whichever
+    # group already holds the gid.
+    for pair in ${HOST_GROUPS}; do \
+        name=${pair%%:*}; g=${pair##*:}; \
+        if ! getent group "$g" >/dev/null; then \
+            if getent group "$name" >/dev/null; then groupmod -g "$g" "$name"; else groupadd -g "$g" "$name"; fi; \
+        fi; \
+        usermod -aG "$(getent group "$g" | cut -d: -f1)" ${username}; \
+    done; \
+    usermod -aG sudo,video ${username}; \
+    echo "${username} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${username}; \
+    chmod 0440 /etc/sudoers.d/${username}; \
+    visudo -c >/dev/null; \
+    # Home: mount points created here, owned by the user. Docker would otherwise create missing parents of the
+    # config/mounts binds (~/.cache/huggingface, ~/.ssh/...) as root, leaving ~/.cache unwritable.
+    mkdir -p /home/${username}/.cache /home/${username}/.ssh /home/${username}/${WS_NAME}; \
+    printf '%s\n' 'set -g mouse on' 'set -g history-limit 10000' > /home/${username}/.tmux.conf; \
+    chown -R ${uid}:${gid} /home/${username}
 
 ENV CUDA_MODULE_LOADING=LAZY \
     EDGELLM_ROOT=${EDGELLM_ROOT} \
-    EDGELLM_VENV=${EDGELLM_VENV} \
-    PATH=${EDGELLM_VENV}/bin:${EDGELLM_ROOT}/build/examples/llm:${EDGELLM_ROOT}/build/examples/multimodal:${PATH} \
+    PATH=${EDGELLM_ROOT}/build/examples/llm:${EDGELLM_ROOT}/build/examples/multimodal:${PATH} \
     FORESIGHT_CONTAINER_BASE=nvcr.io/nvidia/tensorrt:25.11-py3 \
     HOME=/home/${username} \
     HF_HOME=/home/${username}/.cache/huggingface \
-    HUGGINGFACE_HUB_CACHE=/home/${username}/.cache/huggingface
+    HUGGINGFACE_HUB_CACHE=/home/${username}/.cache/huggingface \
+    ROS_DISTRO=${ROS_DISTRO} \
+    ROS_WORKSPACE=/home/${username}/${WS_NAME}
 
-WORKDIR /home/${username}/foresight_ws
+# ROS environment for login shells. COLCON_DEFAULTS_FILE restricts discovery to
+# the packages listed there (see colcon_defaults.yaml); colcon builds with the
+# system python3, the same interpreter that holds torch and Edge-LLM.
+RUN printf '%s\n' \
+    "source /opt/ros/${ROS_DISTRO}/setup.bash" \
+    '[ -f "$ROS_WORKSPACE/install/setup.bash" ] && source "$ROS_WORKSPACE/install/setup.bash"' \
+    'export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}' \
+    'export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}' \
+    'export COLCON_DEFAULTS_FILE=${COLCON_DEFAULTS_FILE:-$ROS_WORKSPACE/colcon_defaults.yaml}' \
+    > /etc/profile.d/ros2.sh && chmod a+r /etc/profile.d/ros2.sh
+
+# memo is never baked: the first login shell of each container installs it from
+# the bind-mounted checkout (editable, with its light runtime deps). The script
+# lives in the workspace so it can change without a rebuild.
+RUN printf '%s\n' \
+    '[ -x "$ROS_WORKSPACE/scripts/setup_memo.sh" ] && "$ROS_WORKSPACE/scripts/setup_memo.sh" --if-needed' \
+    > /etc/profile.d/zz-memo.sh && chmod a+r /etc/profile.d/zz-memo.sh
+
+# By name, not uid:gid: Docker loads supplementary groups (video, render, ...) only for a named USER.
+USER ${username}
+WORKDIR /home/${username}/${WS_NAME}
 
 ENTRYPOINT []
 CMD ["/bin/bash", "-l"]

@@ -10,7 +10,8 @@ _UNAME=$(id -un)
 
 USAGE="$0 [command: build|start|stop|restart|shell|cmd|rm|push] [--name container_name] [--repo dockerhub_user/repo] [--tag tag] [--dockerfile path]"
 
-DOCKER_BUILDKIT=1
+# Exported: the `RUN --mount=type=cache` steps need BuildKit.
+export DOCKER_BUILDKIT=1
 export BUILDAH_FORMAT=docker
 
 # Initialize variables
@@ -48,6 +49,10 @@ if command -v nvpmodel &> /dev/null; then
     HOST_FLAGS+=" --runtime nvidia --privileged --ipc=host --pid host --cap-add SYS_PTRACE "
     JETSON_POWER_MODE_NAME=$(nvpmodel -q 2>/dev/null | sed -n 's/^NV Power Mode: //p' | head -n1)
     JETSON_POWER_MODE_ID=$(nvpmodel -q 2>/dev/null | tail -n1)
+    # L4T R38 is JetPack 7 (Thor): default to its image. --dockerfile overrides.
+    if grep -q "^# R38" /etc/nv_tegra_release 2>/dev/null; then
+        DOCKERFILE_REL="docker/Dockerfile.thor_edgellm"
+    fi
 else
     echo ''
     #echo "This does not appear to be a NVIDIA Jetson device (nvpmodel not found)."
@@ -314,8 +319,18 @@ dockerbuild() {
   fi
   echo "  BASE_STAGE_NAME: $BASE_STAGE_NAME"
 
+  # Device groups to mirror into the image with the host's gids, as "name:gid" pairs, so the in-container
+  # user owns the same device nodes (/dev/nvmap is root:video, /dev/dri/renderD* root:render, ...).
+  HOST_GROUPS=""
+  for g in video render i2c gpio dialout input audio plugdev; do
+    _g_gid=$(getent group "$g" | cut -d: -f3)
+    [ -n "$_g_gid" ] && HOST_GROUPS+="$g:$_g_gid "
+  done
+  echo "  HOST_GROUPS: $HOST_GROUPS"
+
   docker build \
     --network=host \
+    --build-arg HOST_GROUPS="$HOST_GROUPS" \
     --build-arg gid=$_GID \
     --build-arg uid=$_UID \
     --build-arg username=$_UNAME \
@@ -325,6 +340,7 @@ dockerbuild() {
     --build-arg is_jetson=$IS_JETSON_BOOL \
     --build-arg BASE_STAGE_NAME=$BASE_STAGE_NAME \
     --build-arg BLACKWELL_GPU=$BLACKWELL_GPU \
+    --build-arg WS_NAME="$(basename -- "$ROOT")" \
     -t $CONTAINER_NAME \
     -f "$CONTAINER_FILE" $ROOT \
     --progress=plain

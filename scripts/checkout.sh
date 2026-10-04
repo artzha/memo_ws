@@ -32,10 +32,11 @@ clone_or_pull master https://github.com/Livox-SDK/livox_ros_driver2.git livox_ro
 clone_or_pull master git@github.com:ut-amrl/config-reader.git config_reader
 clone_or_pull master git@github.com:ut-amrl/amrl_shared_lib.git amrl_shared_lib
 clone_or_pull master git@github.com:ut-amrl/amrl_maps.git amrl_maps
-clone_or_pull artzha/foresight git@github.com:ut-amrl/amrl_msgs.git amrl_msgs
+clone_or_pull memo git@github.com:ut-amrl/amrl_msgs.git amrl_msgs
 clone_or_pull utamrl_alphatruck git@github.com:ut-amrl/SuperOdom.git
 clone_or_pull ros2_avrecorder git@github.com:ut-amrl/joystick.git joystick
 clone_or_pull ros2_migration git@github.com:ut-amrl/graph_navigation.git graph_navigation
+clone_or_pull main git@github.com:artzha/memo.git memo
 clone_or_pull arthz/foresight git@github.com:ut-amrl/webviz.git webviz
 clone_or_pull master git@github.com:artzha/av_recorder.git
 clone_or_pull main git@github.com:artzha/foresight_public.git foresight_public

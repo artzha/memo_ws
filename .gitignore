@@ -35,3 +35,27 @@ checkpoints/
 # SuperOdom generated artifacts
 maps/superodom/*
 !maps/superodom/.gitkeep
+
+# Python tooling caches
+.pytest_cache/
+
+# Model weights, exports and TensorRT engines (built on the robot; memo_deployment keeps its own under
+# src/memo/memo_deployment/models/)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.onnx.data
+*.engine
+*.plan
+*.trt
+
+# Recordings and media
+*.db3
+*.mcap
+*.bag
+*.mp4
+
+# Rendered at container start by ./container with the robot IP pinned in
+config/cyclonedds.runtime.xml

@@ -1,0 +1,23 @@
+# Build context is the workspace root. Keep it lean: data/ alone is tens of GB.
+# No image copies anything from src/: checkouts are bind-mounted at run time.
+src/
+data/
+build/
+install/
+log/
+
+# Version control
+**/.git
+
+# Python build artifacts
+**/.venv
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info
+
+# Media
+**/*.mp4
+**/*.mcap
+
+# Secrets (supplied at run time via the workspace bind mount)
+**/.env
