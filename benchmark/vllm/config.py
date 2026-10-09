@@ -28,7 +28,7 @@ MODEL_FAMILY_PROFILES: dict[str, dict[str, Any]] = {
     "gemma4": {
         "prefixes": ("google/gemma-4",),
         "engine_kwargs": {
-            "mm_processor_kwargs": {"max_soft_tokens": 280},
+            "mm_processor_kwargs": {"max_soft_tokens": 70},
 
             # ---
             # Gemma 4 uses two attention head dimensions:

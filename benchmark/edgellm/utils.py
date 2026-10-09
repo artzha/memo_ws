@@ -154,8 +154,12 @@ def build_engines(
     engine: dict[str, Any],
     log_stream: IO[str] | None,
     force: bool,
+    llm_args: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Build the LLM and visual TensorRT engines for one exported model."""
+    """Build the LLM and visual TensorRT engines for one exported model.
+
+    ``llm_args`` are extra llm_build flags (e.g. ``--specBase`` for a speculative-decoding base export);
+    record them in ``engine`` too, so a cached build made without them is not reused."""
     if engines_ready(engine_dir, engine) and not force:
         return {"performed": False, "seconds": 0.0, "engine_dir": str(engine_dir)}
     # Build into a staging directory and rename it into place so a reader never
@@ -172,6 +176,7 @@ def build_engines(
         "--maxBatchSize", str(engine["max_batch_size"]),
         "--maxInputLen", str(engine["max_input_len"]),
         "--maxKVCacheCapacity", str(engine["max_kv_cache_capacity"]),
+        *llm_args,
     ]
     returncode = run_logged(llm_command, log_stream, cwd=tools.root)
     if returncode != 0:

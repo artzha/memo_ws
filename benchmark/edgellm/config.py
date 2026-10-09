@@ -43,8 +43,9 @@ MODEL_FAMILY_PROFILES: dict[str, dict[str, Any]] = {
         "export_args": ("--skip-audio",),
         # The Gemma 4 runner caps soft tokens per image at the visual engine's
         # --maxImageTokensPerImage rather than the processor's max_soft_tokens,
-        # so pin it to the 280 the vLLM benchmark used (mm_processor_kwargs).
-        "max_image_tokens_per_image": 280,
+        # so pin it to 70: the ~70 tokens per image the Qwen models produce at
+        # 336x224, and the max_soft_tokens the vLLM benchmark uses.
+        "max_image_tokens_per_image": 70,
     },
 }
 

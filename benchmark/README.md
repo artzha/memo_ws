@@ -32,6 +32,30 @@ to `data/benchmarks/<runtime>/<timestamp>/`.
   per-model `run_model` implementation.
 - `compare.py` — joins a vLLM run and an Edge-LLM run into one comparison.
 
+## Watching a run
+
+The Edge-LLM container ships [xtop](https://github.com/joydeep-b/xtop), a
+btop-like monitor with CPU, GPU (utilization + memory via NVML), RAM, disk, and
+network panels. Open a second shell into the running container and start it:
+
+```bash
+./container shell --name edgellm-thor --dockerfile docker/Dockerfile.thor_edgellm
+xtop
+```
+
+`q` quits, `space` pauses, and `l` switches between the bundled layouts
+(`default`, `gpu-detail`, `simple`). For a headless snapshot, e.g. to log
+alongside a benchmark, use:
+
+```bash
+xtop --probe
+```
+
+GPU metrics require the NVIDIA container runtime, which `./container` enables
+by default; without it xtop reports `GPU: unavailable` but the other panels
+still work. The benchmark's own `ResourceMonitor` records tegrastats/RAM into
+the results regardless, so xtop is for live inspection only.
+
 ## Comparing runs
 
 ```bash

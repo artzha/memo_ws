@@ -24,7 +24,7 @@ TensorRT 10.14.1), compiles Edge-LLM `v0.10.1` for `jetson-thor` under
 ## Run the benchmark
 
 ```bash
-cd /home/ros/foresight_ws
+cd /home/ros/memo_ws
 
 python3 -m benchmark.edgellm.benchmark
 ```
@@ -66,9 +66,10 @@ Even so, do not run two benchmarks at once: they share the GPU and both sets
 of timings would be contaminated.
 
 Per-family settings live in `MODEL_FAMILY_PROFILES` in `config.py`. Gemma 4
-pins `--maxImageTokensPerImage 280` because the Edge-LLM runner takes its
+pins `--maxImageTokensPerImage 70` because the Edge-LLM runner takes its
 per-image soft-token cap from the visual engine rather than from the
-processor's `max_soft_tokens`; 280 is what the vLLM benchmark used.
+processor's `max_soft_tokens`. 70 matches the ~70 tokens per image the Qwen
+models produce at 336×224 and the `max_soft_tokens` the vLLM benchmark uses.
 
 Results are written to `data/benchmarks/edgellm/<timestamp>/` with the same
 `results.json`, `results.csv`, and `summary.md` layout as the vLLM benchmark,

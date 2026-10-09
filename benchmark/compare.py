@@ -203,7 +203,7 @@ def compare(vllm_payload: dict[str, Any], edge_payload: dict[str, Any]) -> tuple
         "encoder-embedding cache disabled); vLLM keeps one engine resident per model with "
         "prefix caching and the multimodal processor cache disabled.",
         "- Prompts are identical across runtimes (same 40 images, same text, same chat template "
-        "settings, thinking disabled); Gemma 4 is capped at 280 soft tokens per image on both.",
+        "settings, thinking disabled); Gemma 4 is capped at 70 soft tokens per image on both.",
     ]
     lines += ["", "## Sample outputs (first batch)", ""]
     for model in models:
