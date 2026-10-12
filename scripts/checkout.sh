@@ -35,12 +35,24 @@ clone_or_pull master git@github.com:ut-amrl/amrl_maps.git amrl_maps
 clone_or_pull memo git@github.com:ut-amrl/amrl_msgs.git amrl_msgs
 clone_or_pull utamrl_alphatruck git@github.com:ut-amrl/SuperOdom.git
 clone_or_pull ros2_avrecorder git@github.com:ut-amrl/joystick.git joystick
+clone_or_pull ros2 git@github.com:ut-amrl/k4a_ros.git k4a_ros
 clone_or_pull ros2_migration git@github.com:ut-amrl/graph_navigation.git graph_navigation
 clone_or_pull main git@github.com:artzha/memo.git memo
 clone_or_pull arthz/foresight git@github.com:ut-amrl/webviz.git webviz
 clone_or_pull master git@github.com:artzha/av_recorder.git
 clone_or_pull main git@github.com:artzha/foresight_public.git foresight_public
 # clone_or_pull amrl_ros2 git@github.com:ut-amrl/elevation_mapping_cupy.git elevation_mapping_cupy
+
+# spot_ros2 vendors spot_wrapper, synchros2 and spot_description as submodules.
+if [ -d "$SRC_DIR/spot_ros2/.git" ]; then
+    git -C "$SRC_DIR/spot_ros2" submodule update --init --recursive
+fi
+
+# k4a_ros vendors amrl_shared_lib and config_reader as submodules, which the
+# pull above initializes; colcon must only see the top-level checkouts of both.
+for d in "$SRC_DIR/k4a_ros/src/shared" "$SRC_DIR/k4a_ros/src/config_reader"; do
+    [ -f "$d/package.xml" ] && touch "$d/COLCON_IGNORE"
+done
 
 # livox_ros_driver2 uses package_ROS2.xml for ROS2, but colcon/ament requires
 # the manifest to be named package.xml.

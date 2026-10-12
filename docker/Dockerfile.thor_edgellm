@@ -2,9 +2,64 @@
 ARG BASE_IMAGE_ARM64=nvcr.io/nvidia/tensorrt:25.11-py3@sha256:6a507190873a87ee42205d5b2392491078aca971b1b25cda5f1053d72366bb89
 ARG BASE_IMAGE_AMD64=nvcr.io/nvidia/tensorrt:25.11-py3
 ARG BASE_STAGE_NAME=base_arm64
+# Builds the Spot C++ SDK and bosdyn_msgs; must be the same Ubuntu (noble) and
+# ROS distro as the final image, whose apt libprotobuf/libgrpc they link.
+ARG SPOT_BUILD_IMAGE=ros:jazzy-ros-base@sha256:ec00a06df4f573a86e4336c4585940f7f614646ef22675ace1b3e14ee0a82cb3
+# One Spot SDK version for the C++ SDK, bosdyn_msgs and the bosdyn-* wheels.
+ARG SPOT_SDK_VERSION=5.0.1
 
 FROM ${BASE_IMAGE_ARM64} AS base_arm64
 FROM ${BASE_IMAGE_AMD64} AS base_amd64
+
+# --- Spot C++ SDK + bosdyn_msgs ---------------------------------------------
+# Upstream ships both only as jammy/Humble binaries (the SDK deb links
+# libprotobuf23, which noble lacks), so they are built here against noble's own
+# protobuf 3.21 / gRPC 1.51 and copied into the final image. A separate stage
+# keeps bosdyn_msgs' build-time protobuf<=4.22 pin away from the Edge-LLM stack.
+# The SDK misses one <cstdint> include that gcc 13 no longer gives it for free.
+FROM ${SPOT_BUILD_IMAGE} AS spot_build
+ARG SPOT_SDK_VERSION
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        cmake \
+        build-essential \
+        pkg-config \
+        python3-pip \
+        libprotobuf-dev \
+        protobuf-compiler \
+        libgrpc++-dev \
+        protobuf-compiler-grpc \
+        libcli11-dev \
+        libeigen3-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --branch "v${SPOT_SDK_VERSION}" --depth 1 https://github.com/rai-opensource/spot-cpp-sdk.git /tmp/spot-cpp-sdk \
+ && cmake -S /tmp/spot-cpp-sdk/cpp -B /tmp/spot-cpp-sdk/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/spot-cpp-sdk \
+        -DCMAKE_CXX_FLAGS="-include cstdint" \
+ && cmake --build /tmp/spot-cpp-sdk/build -j"$(nproc)" \
+ && cmake --install /tmp/spot-cpp-sdk/build \
+ && rm -rf /tmp/spot-cpp-sdk
+# bosdyn_msgs' bosdyn_cmake_module looks for the SDK at /opt/spot-cpp-sdk. The
+# proto2ros it vendors as a submodule predates Python 3.12 (importlib.resources
+# misuse); rosdep installs Jazzy's packaged ros-jazzy-proto2ros instead.
+WORKDIR /opt/bosdyn_ws
+RUN git clone --branch "${SPOT_SDK_VERSION}" --depth 1 \
+        https://github.com/rai-opensource/bosdyn_msgs.git src/bosdyn_msgs \
+ && touch src/bosdyn_msgs/proto2ros/COLCON_IGNORE \
+ && apt-get update \
+ && rosdep update --rosdistro jazzy \
+ && PIP_CONSTRAINT=src/bosdyn_msgs/pip-constraint.txt \
+    rosdep install -i -y -r --from-paths src --rosdistro jazzy \
+        --skip-keys "$(cat src/bosdyn_msgs/rosdep-skip.txt)" \
+ && rm -rf /var/lib/apt/lists/* \
+ && . /opt/ros/jazzy/setup.sh \
+ && colcon build --merge-install --install-base /opt/bosdyn_ws/install \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+ && rm -rf build log src
+
 FROM ${BASE_STAGE_NAME} AS final
 
 ARG username=ros
@@ -101,6 +156,33 @@ RUN pip install --no-cache-dir -c /etc/memo/constraints.txt flash-linear-attenti
  && python3 -c "import fla, causal_conv1d" \
  && pip list --format=freeze --exclude-editable > /etc/memo/constraints.txt
 
+# Robot-side Python: the Spot SDK client (spot_wrapper / spot_driver) and audio
+# capture, constrained like the layers above so none of it can move the Edge-LLM
+# stack; bosdyn runs on its protobuf 7 / numpy 2. opencv-python-headless (also a
+# memo dependency) shadows the numpy-1 python3-opencv that cv_bridge pulls from
+# apt; it stays on OpenCV 4 because 5 renumbered the CV_* type codes, which
+# breaks cv_bridge against ROS's OpenCV 4.6. aiortc is spot_wrapper's Spot CAM WebRTC client, which spot_driver imports
+# even with the CAM off; it caps av<18 while memo needs av>=18.1, and it imports
+# and runs on the newer av, so it goes in without its own dependency pins.
+# open3d is left out: only the arm's hand-camera depth publisher uses it.
+# Declared here, not with the other ARGs, so it does not invalidate the
+# Edge-LLM layers above.
+ARG SPOT_SDK_VERSION
+RUN pip install --no-cache-dir -c /etc/memo/constraints.txt \
+        bosdyn-api==${SPOT_SDK_VERSION} \
+        bosdyn-core==${SPOT_SDK_VERSION} \
+        bosdyn-client==${SPOT_SDK_VERSION} \
+        bosdyn-mission==${SPOT_SDK_VERSION} \
+        bosdyn-choreography-client==${SPOT_SDK_VERSION} \
+        bosdyn-choreography-protos==${SPOT_SDK_VERSION} \
+        inflection \
+        "av>=18.1" aioice "cryptography>=44" google-crc32c pyee pylibsrtp pyopenssl \
+        "opencv-python-headless>=4.10,<5" \
+        sounddevice \
+ && pip install --no-cache-dir --no-deps aiortc==1.15.0 \
+ && python3 -c "import bosdyn.client, bosdyn.api.spot.robot_command_pb2, aiortc, av, cv2; import torch; assert torch.version.cuda.startswith('13.')" \
+ && pip list --format=freeze --exclude-editable > /etc/memo/constraints.txt
+
 # --- ROS 2 ------------------------------------------------------------------
 # Everything below sits after the Edge-LLM build so that editing it never
 # invalidates those (slow) layers.
@@ -143,6 +225,136 @@ RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
         python3-rosdep \
  && rm -rf /var/lib/apt/lists/* \
  && rosdep init && rosdep update --rosdistro "${ROS_DISTRO}"
+
+# --- Sensor drivers -----------------------------------------------------------
+# The drivers themselves live in src/ (scripts/checkout.sh) and build with
+# colcon: spot_ros2, k4a_ros (+ amrl_shared_lib, config_reader), livox_ros_driver2,
+# spot_velodyne, joystick. The image carries their dependencies, the vendor SDKs
+# and the VectorNav overlay. Any pip install rosdep makes below is held to the
+# frozen stack by PIP_CONSTRAINT; apt's python3-* (numpy 1.26, opencv 4.6) land in
+# /usr/lib/python3 and stay shadowed by the pip-owned versions.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-cv-bridge \
+        ros-${ROS_DISTRO}-image-transport \
+        ros-${ROS_DISTRO}-image-transport-plugins \
+        ros-${ROS_DISTRO}-point-cloud-transport \
+        ros-${ROS_DISTRO}-pcl-conversions \
+        ros-${ROS_DISTRO}-velodyne \
+        ros-${ROS_DISTRO}-joy \
+        ros-${ROS_DISTRO}-robot-localization \
+        ros-${ROS_DISTRO}-imu-sensor-broadcaster \
+        ros-${ROS_DISTRO}-tf2-geometry-msgs \
+        ros-${ROS_DISTRO}-tf2-sensor-msgs \
+        ros-${ROS_DISTRO}-diagnostic-updater \
+        ros-${ROS_DISTRO}-foxglove-msgs \
+        # k4a_ros, amrl_shared_lib, config_reader, joystick
+        libgoogle-glog-dev \
+        libgflags-dev \
+        liblua5.2-dev \
+        libgoogle-perftools-dev \
+        cimg-dev \
+        libeigen3-dev \
+        libopencv-dev \
+        # livox_ros_driver2
+        libpcl-dev \
+        libapr1-dev \
+        # MPU6050 (i2c), serial sensors, Azure Kinect mic array, camera streaming
+        libi2c-dev \
+        python3-serial \
+        libserialport0 \
+        libportaudio2 \
+        portaudio19-dev \
+        alsa-utils \
+        gstreamer1.0-tools \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly \
+        gstreamer1.0-libav \
+        # Spot C++ SDK consumers (spot_driver)
+        libprotobuf-dev \
+        protobuf-compiler \
+        libgrpc++-dev \
+        protobuf-compiler-grpc \
+        libcli11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# cv_bridge, rebuilt from the same release as the apt package: apt's Python
+# extension is compiled against numpy 1.26 and fails to import under the image's
+# numpy 2 (spot_driver uses it). The overlay is sourced ahead of the others.
+ARG CV_BRIDGE_VERSION=4.1.0
+RUN git clone --branch "${CV_BRIDGE_VERSION}" --depth 1 https://github.com/ros-perception/vision_opencv.git /tmp/vision_opencv \
+ && mkdir -p /opt/cv_bridge_ws/src \
+ && mv /tmp/vision_opencv/cv_bridge /opt/cv_bridge_ws/src/ \
+ && rm -rf /tmp/vision_opencv \
+ && cd /opt/cv_bridge_ws \
+ && . /opt/ros/${ROS_DISTRO}/setup.sh \
+ && colcon build --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+ && rm -rf build log src \
+ && . install/local_setup.sh \
+ && python3 -c "import numpy as np; from cv_bridge import CvBridge; b = CvBridge(); b.imgmsg_to_cv2(b.cv2_to_imgmsg(np.zeros((4, 6, 3), np.uint8), 'bgr8'), 'rgb8')"
+
+# Azure Kinect SDK (libk4a, with the depth engine) from Microsoft's bionic
+# multiarch repo, the only arm64 build; its dependencies resolve on noble. The
+# debconf answers accept the depth-engine EULA non-interactively.
+ARG K4A_VERSION=1.4.2
+RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+ && echo "deb [arch=arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/18.04/multiarch/prod bionic main" \
+        > /etc/apt/sources.list.d/microsoft-prod.list \
+ && echo 'libk4a1.4 libk4a1.4/accepted-eula-hash string 0f5d5c5de396e4fee4c0753a21fee0c1ed726cf0316204edda484f08cb266d76' | debconf-set-selections \
+ && echo 'libk4a1.4 libk4a1.4/accept-eula boolean true' | debconf-set-selections \
+ && apt-get update && apt-get install -y --no-install-recommends \
+        libk4a1.4=${K4A_VERSION} \
+        libk4a1.4-dev=${K4A_VERSION} \
+ && rm -rf /var/lib/apt/lists/* \
+ && test -f /usr/lib/aarch64-linux-gnu/libk4a1.4/libdepthengine.so.2.0
+
+# Livox-SDK2 into /usr/local, where livox_ros_driver2 looks for it.
+ARG LIVOX_SDK2_VERSION=v1.3.1
+RUN git clone --branch "${LIVOX_SDK2_VERSION}" --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /tmp/Livox-SDK2 \
+ && /usr/bin/cmake -S /tmp/Livox-SDK2 -B /tmp/Livox-SDK2/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_FLAGS="-include cstdint" \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+ && /usr/bin/cmake --build /tmp/Livox-SDK2/build -j"$(nproc)" \
+ && /usr/bin/cmake --install /tmp/Livox-SDK2/build \
+ && rm -rf /tmp/Livox-SDK2 \
+ && ldconfig \
+ && test -f /usr/local/lib/liblivox_lidar_sdk_shared.so
+
+# VectorNav driver, as an overlay in /opt/vn_ws (as on the Orin image).
+ARG VECTORNAV_BRANCH=ros2_fast
+RUN mkdir -p /opt/vn_ws/src \
+ && git clone --branch "${VECTORNAV_BRANCH}" --depth 1 https://github.com/ut-amrl/vectornav.git /opt/vn_ws/src/vectornav \
+ && cd /opt/vn_ws \
+ && . /opt/ros/${ROS_DISTRO}/setup.sh \
+ && apt-get update \
+ && PIP_CONSTRAINT=/etc/memo/constraints.txt rosdep install --from-paths src --ignore-src -y -r --rosdistro "${ROS_DISTRO}" \
+ && rm -rf /var/lib/apt/lists/* \
+ && colcon build --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+ && rm -rf build log
+
+# Spot: the SDK and bosdyn_msgs from the spot_build stage, then spot_ros2's
+# remaining dependencies, resolved from a throwaway clone at a commit with the
+# Jazzy fixes (#816). Skipped: the bosdyn packages and spot_wrapper (already
+# here, the Python ones from the pip layer) and the GUI ones, which only spot_rviz_plugins / joint_state_publisher_gui use.
+COPY --from=spot_build /opt/spot-cpp-sdk /opt/spot-cpp-sdk
+COPY --from=spot_build /opt/bosdyn_ws/install /opt/bosdyn_ws/install
+ARG SPOT_ROS2_COMMIT=fc0eb245d47e146cf2a4c4fa47c9739f89bc79bd
+RUN git init -q /tmp/spot_ros2 \
+ && cd /tmp/spot_ros2 \
+ && git fetch -q --depth 1 https://github.com/rai-opensource/spot_ros2.git "${SPOT_ROS2_COMMIT}" \
+ && git checkout -q FETCH_HEAD \
+ && git submodule update -q --init --depth 1 \
+ && apt-get update \
+ && PIP_CONSTRAINT=/etc/memo/constraints.txt rosdep install -i -y -r \
+        --from-paths /tmp/spot_ros2 /opt/bosdyn_ws/install/share --rosdistro "${ROS_DISTRO}" \
+        --skip-keys "bosdyn bosdyn-spot-cpp bosdyn_msgs bosdyn_api_msgs bosdyn_cmake_module spot_wrapper bosdyn-choreography-protos rviz2 joint_state_publisher_gui python3-tk" \
+ && cd / && rm -rf /var/lib/apt/lists/* /tmp/spot_ros2 \
+ && . /opt/ros/${ROS_DISTRO}/setup.sh \
+ && . /opt/bosdyn_ws/install/local_setup.sh \
+ && python3 -c "import bosdyn_api_msgs.msg, bosdyn_api_msgs.math_helpers, bosdyn_spot_api_msgs.msg, cv2, numpy; assert numpy.__version__.startswith('2.')"
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
@@ -202,9 +414,14 @@ ENV CUDA_MODULE_LOADING=LAZY \
 
 # ROS environment for login shells. COLCON_DEFAULTS_FILE restricts discovery to
 # the packages listed there (see colcon_defaults.yaml); colcon builds with the
-# system python3, the same interpreter that holds torch and Edge-LLM.
+# system python3, the same interpreter that holds torch and Edge-LLM. The
+# cv_bridge, bosdyn_msgs and VectorNav overlays sit between ROS and the
+# workspace; the bosdyn one also puts /opt/spot-cpp-sdk/lib on LD_LIBRARY_PATH.
 RUN printf '%s\n' \
     "source /opt/ros/${ROS_DISTRO}/setup.bash" \
+    'source /opt/cv_bridge_ws/install/local_setup.bash' \
+    'source /opt/bosdyn_ws/install/local_setup.bash' \
+    'source /opt/vn_ws/install/local_setup.bash' \
     '[ -f "$ROS_WORKSPACE/install/setup.bash" ] && source "$ROS_WORKSPACE/install/setup.bash"' \
     'export RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}' \
     'export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}' \

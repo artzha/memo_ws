@@ -4,9 +4,29 @@
 #
 # base-paths lists exactly the packages to build; discovery from src/ would
 # also pick up src/foresight_public and anything else checked out there.
+# Drivers not checked out yet (scripts/checkout.sh) are skipped silently.
+# packages-skip drops spot_ros2's GUI and example packages: the image is headless.
 build:
-  base-paths: [src/amrl_msgs, src/memo/memo_deployment]
+  base-paths: &paths
+    - src/amrl_msgs
+    - src/memo/memo_deployment
+    # sensor drivers
+    - src/spot_ros2
+    - src/spot_velodyne
+    - src/k4a_ros
+    - src/amrl_shared_lib
+    - src/config_reader
+    - src/livox_ros_driver2
+    - src/joystick
+  packages-skip: &skip
+    - spot_rviz_plugins
+    - spot_examples
+    - synchros2_tutorials_example
+    - synchros2_tutorials_interfaces_example
+  cmake-args: [-DCMAKE_BUILD_TYPE=Release, -DBUILD_TESTING=OFF]
 list:
-  base-paths: [src/amrl_msgs, src/memo/memo_deployment]
+  base-paths: *paths
+  packages-skip: *skip
 test:
-  base-paths: [src/amrl_msgs, src/memo/memo_deployment]
+  base-paths: *paths
+  packages-skip: *skip
